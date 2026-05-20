@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Retrieval: an interactive monograph on retrieval-augmented generation</title>
+  <meta name="description" content="A long-form interactive treatment of retrieval-augmented generation: the embedding space, similarity measures, chunking, approximate nearest-neighbour search, rerankers, hybrid sparse-plus-dense fusion, and the full RAG pipeline. With a literature review.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <div class="progress" aria-hidden="true"><span id="progress-bar"></span></div>
+
+  <header class="site-head">
+    <div class="wrap">
+      <a class="brand" href="index.html">Retrieval</a>
+      <span class="tagline">An interactive monograph on retrieval-augmented generation</span>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1" class="essay">
+    <div class="wrap">
+      <h1>Retrieval</h1>
+      <p class="lede">
+        How to teach a generative model to read first, by indexing a corpus
+        into vectors and pulling the most relevant passages into the prompt
+        before the model answers.
+      </p>
+
+      <p class="docmeta">
+        An interactive monograph in ten sections, with seven live figures.
+        <b>Reading time</b> roughly fifty minutes. The figures are operable by
+        mouse, touch and keyboard, and the document conforms to WCAG&nbsp;2.2&nbsp;AA.
+        Built as a single static page in vanilla HTML, CSS and JavaScript, with
+        no framework and no build step.
+      </p>
+
+      <section class="abstract" aria-label="Abstract">
+        <h2>Abstract</h2>
+        <p>
+          A language model generates fluent text from the patterns it absorbed
+          during training, but it does not, by itself, know what is in any
+          particular document, and it cannot cite the source of a claim. The
+          construction known as retrieval-augmented generation patches this
+          gap by attaching to the model a retrieval system: when a user
+          submits a query, the system first searches a corpus for the
+          passages most relevant to that query, then prepends those passages
+          to the prompt so the model writes its answer with the corpus in
+          front of it. The retrieval component is information retrieval in
+          its modern form, with documents and queries represented by dense
+          vectors and similarity measured by inner products in that vector
+          space.
+        </p>
+        <p>
+          This document develops the construction from the foundation up. It
+          treats the embedding space, the choice between cosine and Euclidean
+          similarity, the practical problem of breaking long documents into
+          retrievable chunks, the data structure that makes nearest-neighbour
+          search tractable on a corpus of millions of vectors, the second-pass
+          rerankers that refine an approximate first-pass result, and the
+          hybrid retrievers that combine classical term matching with dense
+          embeddings. Every figure runs the real algorithm over synthetic
+          data: an exact nearest-neighbour scan, a working hierarchical
+          greedy search, and a reciprocal-fusion combiner.
+        </p>
+      </section>
+
+      <nav class="toc" aria-label="Table of contents">
+        <h2>Contents</h2>
+        <ol>
+          <li><a href="#s1">Augmenting generation with retrieval</a></li>
+          <li><a href="#s2">Embeddings and the embedding space</a></li>
+          <li><a href="#s3">A history of retrieval-augmented generation: a literature review</a></li>
+          <li><a href="#s4">Similarity: cosine, dot product, Euclidean</a></li>
+          <li><a href="#s5">Chunking the document</a></li>
+          <li><a href="#s6">Approximate nearest-neighbour search</a></li>
+          <li><a href="#s7">Rerankers and cross-encoders</a></li>
+          <li><a href="#s8">Hybrid search: sparse and dense together</a></li>
+          <li><a href="#s9">The full pipeline</a></li>
+          <li><a href="#s10">Conclusion and limits</a></li>
+        </ol>
+      </nav>
+
+      <section id="s1">
+        <h2><span class="secnum">1</span>Augmenting generation with retrieval</h2>
+        <p>
+          A large language model trained on a fixed corpus carries the
+          information it absorbed during training in the values of its
+          parameters, and it can return that information when asked. There
+          are two limits on what this storage can do. The first is its date.
+          The model knows what was in its training set, not what has been
+          published since, and what it does know it cannot reliably attribute
+          to a source. The second is its precision. Parametric memory is
+          lossy: facts the model encountered only a few times during training
+          can be misremembered or invented, and the lossy nature is not
+          predictable from the outside. A user reading the model's output
+          cannot tell, from the output alone, which claims came from the
+          training corpus, which were generalised from related material, and
+          which were confabulated.
+        </p>
+        <p>
+          The remedy is to give the model access to a corpus at the moment of
+          generation. Rather than asking the model to recall, the system
+          retrieves: it finds the passages of the corpus most relevant to the
+          user's query and inserts them into the prompt before the model
+          writes its answer. The model then composes a response with the
+          retrieved passages in its working context, where it can read them
+          token by token. This is retrieval-augmented generation, and the
+          system as a whole has two distinct components: a retriever, which
+          turns the query into a set of relevant passages, and a generator,
+          which writes the answer using those passages as context.
+        </p>
+        <p>
+          The advantages are several. The corpus can be updated independently
+          of the model: a new document added to the corpus is available to
+          the next query without any retraining. The system can cite, because
+          it knows which passages it pulled. The generator's failure modes
+          shift: it is less likely to fabricate when the relevant facts are
+          in front of it, and the bounded context length means that a finite
+          and inspectable set of passages governs each answer. The
+          disadvantages are also several. The retriever can return passages
+          that are off-topic or actively misleading, and the generator,
+          unable to second-guess its retriever, will write a confident answer
+          on a wrong premise. The rest of this document treats the components
+          of the retriever in turn, with an honest account of where each can
+          go wrong.
+        </p>
+        <dl class="term">
+          <dt>Retriever</dt>
+          <dd>
+            The component that turns a query into a list of relevant
+            documents. In modern systems it is a function that maps the query
+            and each document to vectors in a common space, ranks documents
+            by the similarity of their vectors to the query's vector, and
+            returns the top-k matches. The vectors are produced by an encoder
+            model, and the ranking is computed by an index that supports fast
+            nearest-neighbour search.
+          </dd>
+        </dl>
+      </section>
+
+      <section id="s2">
+        <h2><span class="secnum">2</span>Embeddings and the embedding space</h2>
+        <p>
+          The crucial object in modern retrieval is the embedding. Given a
+          piece of text, an embedding model returns a dense vector of a few
+          hundred to a few thousand numbers that summarises its content. The
+          model is trained so that texts with similar meanings produce
+          vectors that are near each other in the vector space, and texts
+          with different meanings produce vectors that are far apart. The
+          training objective is typically a contrastive one: pairs of texts
+          known to be related are pulled together and unrelated pairs are
+          pushed apart. The model that results does not know the texts it
+          will be asked about at inference time; it has learned a general
+          mapping from text into the embedding space.
+        </p>
+        <p>
+          Indexing a corpus for retrieval consists of running each document,
+          or each chunk of each document, through the embedding model and
+          storing the resulting vectors together with pointers back to the
+          original text. Answering a query consists of running the query
+          through the same model, obtaining its query vector, and finding
+          the corpus vectors closest to it. This compactly inverts the older
+          information-retrieval picture in which queries and documents were
+          matched by overlapping words. In the embedding picture they are
+          matched by their positions in a learned vector space, and a
+          document whose words never appear in the query can still be
+          returned if the model has learned that they are talking about the
+          same thing.
+        </p>
+
+        <div id="fig-embedding"></div>
+
+        <p>
+          The figure above represents an embedding space in two dimensions
+          for visibility. The corpus consists of points clustered into three
+          topics, and a draggable query point returns its k nearest
+          neighbours under a choice of metric. The two-dimensional view is a
+          drastic simplification: real embedding spaces are several hundred
+          dimensional, and the geometry of high-dimensional spaces is
+          notoriously counter-intuitive. The fraction of the unit ball
+          concentrated near its boundary, the equidistribution of random
+          pairs of points at the same distance, and the gap between
+          nearest-neighbour and farthest-neighbour distances are all
+          phenomena that have to be managed by both the index and the
+          retrieval objective. Two facts that nonetheless transfer from the
+          two-dimensional picture are useful. The space is continuous, so
+          small changes to the query produce small changes to its
+          neighbourhood, and the neighbourhood is a topological property:
+          adding documents at random outside the query's vicinity does not
+          change which documents are returned.
+        </p>
+        <p>
+          The shape of the embedding space is the outcome of how the encoder
+          was trained, and a few facts about modern training objectives are
+          worth recording. The dominant scheme is contrastive: for each query
+          in the training data a positive passage that answers it and one or
+          more negative passages that do not are presented to the model, and
+          a loss function rewards the dot product between the query and the
+          positive while penalising the dot products between the query and
+          the negatives. The negatives can be sampled at random, taken from
+          the top of a previous retriever's results to make them hard, or
+          generated by a separate model. The choice of negatives matters
+          disproportionately: an encoder trained against easy negatives
+          appears excellent on its training set and is brittle in
+          deployment, while an encoder trained against deliberately hard
+          negatives is robust but more expensive to train. The encoder used
+          in practice is the outcome of several such rounds of training,
+          with the negatives at each round drawn from the previous round's
+          retriever, and the embedding space at the end of training is the
+          stable point of that loop.
+        </p>
+      </section>
+
+      <section id="s3">
+        <h2><span class="secnum">3</span>A history of retrieval-augmented generation: a literature review</h2>
+        <p>
+          Retrieval-augmented generation, despite the recent visibility of the
+          term, sits on a stack of older work. Each layer of the stack was
+          introduced to remove a definite limitation of the layer beneath it,
+          and the modern construction is best read as the resolution of that
+          sequence.
+        </p>
+        <p>
+          The deepest layer is classical information retrieval, in which a
+          document is represented by the counts of the words it contains. The
+          vector space model of Salton, Wong and Yang in 1975
+          <a class="cite" href="#ref-1">[1]</a> wrote each document as a
+          vector in a space whose dimensions are the vocabulary of the
+          corpus, and ranked documents by the cosine similarity of their
+          vectors to the vector of the query. The weighting of the
+          coordinates by the inverse document frequency, due to Karen Spärck
+          Jones in 1972 <a class="cite" href="#ref-2">[2]</a>, gave rare
+          terms more weight than common ones, and Robertson and Spärck
+          Jones's BM25 ranking <a class="cite" href="#ref-3">[3]</a>, which
+          appeared in the late 1970s and was refined in the 1990s, became the
+          standard sparse retrieval method. The limitation of this layer is
+          that it requires the query and the document to share words: a
+          query that asks "who started the French Revolution" cannot match a
+          passage that names the storming of the Bastille if the word
+          "revolution" does not appear in the passage. The vocabulary
+          mismatch problem is the gap the next layer was made to close.
+        </p>
+        <p>
+          The first attempt to close it was the move from one-hot
+          term-frequency vectors to dense low-dimensional embeddings of
+          words. Mikolov and colleagues' Word2vec in 2013
+          <a class="cite" href="#ref-4">[4]</a>, with predecessors in latent
+          semantic indexing and neural language models, trained a small
+          neural network to predict the context in which a word appears and
+          used the trained word vectors as features. Words with similar
+          contexts produced similar vectors, and the vocabulary mismatch
+          problem softened, because related words now stood near each other
+          in the vector space. The limitation of word-level embeddings was
+          that a query or a document was a sequence of words, and a sequence
+          had to be reduced to a single vector somehow. Averaging or summing
+          word vectors lost much of the structure that distinguished
+          documents from each other.
+        </p>
+        <p>
+          The next reframing was the rise of the transformer and BERT
+          <a class="cite" href="#ref-5">[5]</a>, the bidirectional encoder
+          of Devlin and colleagues from 2018. BERT was trained on the
+          masked-language objective to produce contextual word
+          representations, and from those a representation of an entire
+          sentence or passage could be derived. The original BERT was not,
+          however, an off-the-shelf sentence encoder: its sentence
+          representations were poor at out-of-the-box similarity. Reimers
+          and Gurevych's Sentence-BERT in 2019
+          <a class="cite" href="#ref-6">[6]</a> showed that a small siamese
+          training scheme on BERT, with a sentence-pair classification
+          objective, produced sentence vectors whose cosine similarities
+          tracked semantic similarity. This made dense sentence encoders
+          practical, and the standard architecture for dense retrieval
+          assumed roughly that shape.
+        </p>
+        <p>
+          The application of dense encoders to open-domain question answering
+          came with Karpukhin and colleagues' Dense Passage Retrieval
+          <a class="cite" href="#ref-7">[7]</a> in 2020. DPR used two
+          BERT-based encoders, one for queries and one for passages, trained
+          with a contrastive objective so that the passage containing the
+          answer to a question was pulled toward the question's vector and
+          unrelated passages were pushed away. The result was a retriever
+          whose first-stage recall exceeded that of BM25 on open-domain QA
+          benchmarks, and that fits in a single inner-product index. The
+          limitation it introduced, in turn, was that the inner product was
+          computed in a vector space without explicit term overlap, so
+          purely lexical signals were sometimes ignored: a date or a proper
+          noun in a query, central to the answer, was not always preserved
+          in the dense match.
+        </p>
+        <p>
+          Khattab and Zaharia's ColBERT <a class="cite" href="#ref-8">[8]</a>
+          in 2020 addressed that limitation with a late-interaction model.
+          Rather than a single passage vector, ColBERT stored a vector per
+          token of the passage and computed the relevance of a passage to a
+          query as the sum, over query tokens, of the maximum inner product
+          with any passage token. This preserved lexical signals at the
+          token level while keeping the model's contextual representations,
+          and it pushed the accuracy of dense retrieval closer to that of
+          slow cross-encoder rerankers at first-stage cost. It also
+          highlighted that the retriever and the reranker are positions on a
+          spectrum rather than two distinct artefacts: the difference is the
+          ratio between accuracy and the size of the candidate set each can
+          afford to process.
+        </p>
+        <p>
+          The complementary line of work was the index. A retriever that
+          must scan all of a million-vector corpus for every query is too
+          slow to be useful. Malkov and Yashunin's HNSW
+          <a class="cite" href="#ref-9">[9]</a>, published in 2018, gave a
+          hierarchical proximity graph supporting greedy nearest-neighbour
+          search whose construction time and query time were both
+          logarithmic in the size of the corpus in practice, and whose
+          recall rivalled that of slower exact methods. HNSW, together with
+          the inverted-file plus product-quantisation indices of Jégou and
+          colleagues that had preceded it, made dense retrieval on millions
+          to billions of vectors a practical engineering problem.
+        </p>
+        <p>
+          With the retrieval components in place, the question of how to use
+          them with a generator became central. Lewis and colleagues' RAG
+          <a class="cite" href="#ref-10">[10]</a> in 2020 was the first
+          architecture to make this an end-to-end trainable system: the
+          retriever returned candidate passages, the generator wrote the
+          answer conditioned on those passages, and gradients flowed back
+          through both. REALM <a class="cite" href="#ref-11">[11]</a> and
+          related concurrent work pretrained the joint system. RETRO
+          <a class="cite" href="#ref-12">[12]</a> in 2022 extended the
+          retrieval-conditioning trick deep into the architecture, letting a
+          much smaller language model match the performance of a much
+          larger one by reading retrieved chunks at every transformer
+          layer. The contemporary practice has since broadened to include
+          retrieval as an interaction pattern around frozen
+          general-purpose language models, of which the present commercial
+          systems are examples.
+        </p>
+        <p>
+          Two threads run through this history. The first is the gradual
+          replacement of word-level matching by representation learning: the
+          retrieval question moved from the vocabulary to the embedding
+          space, and the embedding space has steadily acquired more of the
+          contextual structure of language. The second is the integration of
+          the retriever with the generator, from systems where the two were
+          separate processes glued together at inference, through
+          architectures where the system as a whole was trained, to the
+          present pattern of treating retrieval as a tool the language model
+          calls.
+        </p>
+        <a class="totop" href="#main">Return to contents</a>
+      </section>
+
+      <section id="s4">
+        <h2><span class="secnum">4</span>Similarity: cosine, dot product, Euclidean</h2>
+        <p>
+          Two vectors in the embedding space are deemed close by some scalar
+          comparison, and the choice of comparison is part of the system's
+          design. Three are in common use. The dot product is the unweighted
+          inner product of the two vectors. The cosine similarity is the dot
+          product divided by the product of the two vectors' norms, so that
+          it depends only on the angle between them and not on their
+          magnitudes. The Euclidean distance is the length of the difference
+          vector, and it does depend on the magnitudes.
+        </p>
+        <p>
+          The three are related but not interchangeable. For vectors that
+          have been normalised to unit length, the cosine similarity and the
+          dot product agree, and minimising the Euclidean distance is
+          equivalent to maximising the cosine. For vectors that have not
+          been normalised, they part ways. The dot product favours documents
+          whose vectors have large magnitude, which can be desirable when
+          magnitude encodes a meaningful signal such as the length or
+          confidence of a passage, and which can be misleading otherwise.
+          The Euclidean distance penalises magnitude directly, and the
+          cosine ignores it. Most modern dense retrievers normalise their
+          vectors and use the cosine, which removes the modelling decision
+          and gives the metric a clean interpretation as the angle between
+          two pieces of text in the embedding space.
+        </p>
+
+        <div id="fig-metrics"></div>
+
+        <p>
+          The figure above marks the nearest corpus point to a draggable
+          query under both metrics. For most positions of the query the two
+          metrics agree, because most corpus points are at similar
+          distances from the canvas centre. When the query is moved near
+          the boundary the metrics often disagree: the Euclidean nearest is
+          the corpus point at the smallest absolute distance, while the
+          cosine nearest is the corpus point in the same angular direction
+          as the query, even if it is further away along the line. The
+          disagreement is the practical reason for choosing one metric and
+          sticking with it: a system that mixes metrics in its training
+          objective and its inference, or that compares scores from
+          different metrics across runs, is producing rankings that mean
+          different things at different times.
+        </p>
+        <p>
+          For the special case of vectors taken from a model trained with
+          inner-product objective, an additional subtlety arises. The dot
+          product is an unbounded measure: doubling both vectors quadruples
+          it. The cosine is bounded between negative one and one. When the
+          system needs to convert similarity into a probability, as in the
+          softmax-normalised attention of a reranker, the bounded measure
+          is easier to manage. When the system needs to discriminate among
+          near-duplicate candidates the unbounded measure gives more
+          headroom. The choice of metric, like the choice of cost in
+          optimal transport, is part of the data of the problem and shapes
+          the answer.
+        </p>
+        <p>
+          A further consideration is the curse of dimensionality. In a
+          high-dimensional space, pairs of random points are concentrated at
+          roughly the same distance: the variance of the distance shrinks
+          relative to its mean, so the ratio between the nearest neighbour's
+          distance and the farthest neighbour's distance approaches one. A
+          naive nearest-neighbour query in such a space is therefore poorly
+          conditioned. The embedding spaces in which dense retrieval
+          operates avoid this fate because the encoder has been trained to
+          place the relevant documents distinctly closer to the query than
+          the irrelevant ones: the geometry produced by training is not the
+          geometry of random points. This is one of the reasons that an
+          off-the-shelf BERT model performs poorly as an embedding model
+          out of the box and improves substantially once it is fine-tuned
+          with a sentence-pair objective. The training is what curves the
+          space so that nearest-neighbour search is meaningful in the first
+          place; the curse of dimensionality is a property of unstructured
+          spaces, not of trained ones.
+        </p>
+      </section>
+
+      <section id="s5">
+        <h2><span class="secnum">5</span>Chunking the document</h2>
+        <p>
+          An embedding model receives a sequence of tokens and returns a
+          single vector for the whole sequence, but its maximum input length
+          is bounded, often at a few hundred or a few thousand tokens. A
+          document longer than this maximum cannot be embedded as one piece,
+          and even if it could, the result would be a vector representing
+          the entire document, which is too coarse a unit for retrieval. A
+          query asking about a specific fact wants the paragraph that
+          contains the fact, not the document that contains the paragraph.
+          The remedy is to split the document into chunks, embed each
+          chunk, and store the chunks as the units of retrieval.
+        </p>
+        <p>
+          The chunking decision interacts with several other parts of the
+          system. Smaller chunks give finer retrieval granularity, but they
+          carry less context, so a chunk that is informative only in the
+          presence of its surrounding text becomes confusing on its own.
+          Larger chunks carry more context but bear less specific signal,
+          and their embeddings are averages over the chunk's topics. A
+          chunk that fits comfortably in the generator's context window
+          allows the generator to read it whole; a chunk that does not
+          forces a second pass of summarisation or selection.
+        </p>
+
+        <div id="fig-chunking"></div>
+
+        <p>
+          The figure above shows the same synthetic document split by three
+          strategies. The fixed strategy splits at a fixed number of words
+          regardless of the document's structure, which is simple, fast, and
+          insensitive to where boundaries fall. The sentence strategy
+          respects natural sentence ends, which often coincide with
+          meaningful boundaries. The sliding strategy overlaps adjacent
+          chunks, which trades storage for a higher chance that any given
+          fact will appear near the centre of at least one chunk. Each
+          strategy makes some queries easier and others harder, and the
+          choice in production is usually empirical: try each on a held-out
+          set of queries and measure the recall of the answer-bearing
+          passages.
+        </p>
+        <p>
+          A more sophisticated approach treats chunking as a learned step.
+          Some systems train a small model to predict semantic boundaries
+          in the document and chunk along those boundaries. Others embed
+          each candidate sentence individually and group consecutive
+          sentences whose embeddings drift more than a threshold,
+          recovering paragraphs that are coherent in the embedding sense
+          rather than in the typographic one. The benefit is that the
+          chunks tend to be self-contained on the topic they cover; the
+          cost is the extra preprocessing pass, and the dependence of the
+          chunking on a model whose later replacement may invalidate the
+          existing index.
+        </p>
+      </section>
+
+      <section id="s6">
+        <h2><span class="secnum">6</span>Approximate nearest-neighbour search</h2>
+        <p>
+          A corpus of any practical size contains millions of chunk vectors.
+          Computing the exact nearest neighbours of a query vector by a
+          linear scan over all of them is straightforward but slow: each
+          query costs work proportional to the size of the corpus, and the
+          constant factor is the dimension of the embedding. A retriever
+          that must serve a few thousand queries a second on a corpus of a
+          hundred million chunks cannot afford a linear scan. The standard
+          response is an index data structure that supports approximate
+          nearest-neighbour search, returning the true nearest neighbours
+          most of the time and accepting a small recall loss in exchange
+          for a large speed gain.
+        </p>
+        <p>
+          Three families of indices dominate the practical landscape. The
+          inverted-file index partitions the embedding space by k-means
+          clustering and, at query time, scans only the points in the few
+          clusters nearest to the query. Product quantisation, often used
+          alongside an inverted file, compresses each stored vector by
+          replacing chunks of its coordinates with the indices of nearby
+          centroids in a small codebook, which shrinks the memory needed
+          per vector at the cost of approximating its position. The third
+          family, hierarchical navigable small worlds, builds a multi-layer
+          proximity graph in which the top layers are sparse long-range
+          shortcuts and the bottom layer is a dense fine-grained graph, and
+          answers a query by greedy descent through the layers.
+        </p>
+
+        <div id="fig-hnsw"></div>
+
+        <p>
+          The figure above runs a small HNSW-style search. At each step the
+          algorithm examines the neighbours of the current node and moves
+          to the one nearest the query if the move improves on the current
+          distance; when no neighbour improves, the search drops to the
+          next layer. The first few hops, on the sparse top layer, cover
+          large distances cheaply, and the later hops, on the denser
+          layers, refine the candidate. The total work is sublinear in the
+          corpus size, in contrast to the linear-scan baseline, and the
+          recall against the exact answer can be made arbitrarily high by
+          increasing the search width, which is the number of best
+          candidates the algorithm keeps in flight at each step.
+        </p>
+        <p>
+          HNSW is robust to the dimension of the embedding space within the
+          range in which embeddings are used in practice, but it is not a
+          free lunch. The construction phase costs work approximately
+          linearithmic in the corpus size, and the memory footprint of the
+          graph is a constant multiple of the corpus vectors. The index is
+          immutable in its simplest form: incremental insertion is possible
+          but degrades the graph's connectivity over time, and production
+          systems periodically rebuild the index. The trade-offs differ
+          between HNSW, IVF, and product quantisation, and the
+          deployment-relevant comparison is rarely about query speed alone,
+          which all three can achieve, but about the combination of build
+          time, memory footprint, freshness, and recall.
+        </p>
+        <p>
+          A useful way to compare indices in deployment is the
+          recall-versus-latency curve. Holding the corpus fixed and varying
+          the search width of an HNSW index, or the number of clusters
+          probed in an inverted-file index, or the codebook size of a
+          product-quantised index, sweeps out a curve whose horizontal axis
+          is query latency and whose vertical axis is the fraction of the
+          true top-k results the index returns. Different index families
+          dominate different regions of this curve. HNSW typically wins at
+          high recall and moderate latency. Inverted-file indices with
+          product quantisation typically win when the corpus is too large
+          to hold in memory and a small recall loss can be exchanged for a
+          large memory saving. Linear scan still wins at very small corpus
+          sizes and at very high recall requirements. A serious retrieval
+          system measures the curve for its own corpus and query
+          distribution rather than relying on the published benchmarks,
+          because the curve depends substantially on the geometry of the
+          vectors and on the distribution of queries.
+        </p>
+      </section>
+
+      <section id="s7">
+        <h2><span class="secnum">7</span>Rerankers and cross-encoders</h2>
+        <p>
+          The first-stage retriever, whether sparse or dense, has been
+          optimised for speed at the cost of accuracy. It runs a single
+          inner product or a single greedy graph descent for each query,
+          and it returns a candidate list of perhaps a few dozen to a few
+          hundred passages. The candidate list contains most of the
+          relevant material most of the time, but its ordering reflects
+          only the coarse similarity captured by an inner product of two
+          independently produced vectors. A reranker is a second pass that
+          reads both the query and each candidate passage together,
+          producing a finer score by attending to their interaction.
+        </p>
+        <p>
+          The classical reranker architecture is the cross-encoder: a
+          single transformer model takes the concatenation of the query
+          and a candidate passage as its input, runs the joint sequence
+          through its layers, and reads off a scalar relevance score from
+          the special classification token at the top of the model. The
+          cross-encoder is more accurate than the dense bi-encoder
+          retriever because it can attend across query and passage tokens,
+          and it is far slower because every query-passage pair requires a
+          full transformer pass. The reranker is therefore restricted to
+          the small candidate set the first-stage retriever returns, where
+          its cost is manageable.
+        </p>
+
+        <div id="fig-rerank"></div>
+
+        <p>
+          The figure above shows a candidate list before and after
+          reranking. The initial order is set by the first-stage dense
+          score, and a few candidates that the reranker rates highly were
+          ranked low by the first stage. After reranking the lists agree
+          on most of the top candidates but disagree at the margins, which
+          is the usual pattern: the cross-encoder corrects the dense
+          retriever where the dense retriever was right approximately but
+          wrong specifically. The figure's reranker score is synthetic but
+          chosen to mimic the behaviour of a real cross-encoder, with
+          occasional substantial reorderings of the top few results.
+        </p>
+        <p>
+          Production retrieval systems almost always include a reranker.
+          The two-pass architecture, sometimes called retrieve-and-rerank,
+          allows the system to use a fast and shallow first stage that
+          recalls many candidates and a slower deep stage that orders
+          them, and the combined accuracy at the same total budget exceeds
+          what either alone could achieve. The reranker's training
+          objective is usually a pairwise or listwise loss on labelled
+          query-passage pairs, and the data for that training is often the
+          most valuable annotation a retrieval team owns. Late-interaction
+          models such as ColBERT
+          <a class="cite" href="#ref-8">[8]</a> represent a third position
+          between the bi-encoder and the cross-encoder: they preserve
+          token-level signals at the cost of storing more per passage, and
+          they are sometimes used as the only stage in systems whose
+          corpus is small enough.
+        </p>
+      </section>
+
+      <section id="s8">
+        <h2><span class="secnum">8</span>Hybrid search: sparse and dense together</h2>
+        <p>
+          Sparse retrievers like BM25 and dense retrievers like DPR have
+          complementary strengths. Sparse retrievers are good at exact
+          matches of rare terms: a proper noun, a date, an unusual technical
+          term, or a verbatim phrase moves them strongly. They struggle
+          when the query and the document do not share words, even when
+          they share meaning. Dense retrievers are good at the opposite:
+          they handle paraphrase and synonymy, but they sometimes ignore
+          the exact tokens of the query in favour of overall topical
+          similarity. A single retrieval system can take the union of the
+          two by running both first-stage retrievers and combining their
+          scores.
+        </p>
+        <p>
+          The combination is usually done by score-level fusion. The two
+          retrievers' scores are normalised, often by min-max scaling or by
+          rank-to-score transformation, and combined as a weighted average.
+          The weighting parameter is a hyperparameter tuned against a
+          development set. A more robust alternative is reciprocal rank
+          fusion, in which each document's contribution from a retriever is
+          one over a constant plus its rank in that retriever's list, and
+          the contributions from the two retrievers are summed. Reciprocal
+          rank fusion is robust to score normalisation problems because it
+          uses ranks rather than raw scores, and it is the standard
+          combiner when the two retrievers' score distributions are
+          difficult to align.
+        </p>
+
+        <div id="fig-hybrid"></div>
+
+        <p>
+          The figure above shows the two ranked lists and their fused
+          result as a function of the dense weight. At one extreme the
+          fused result equals the sparse list; at the other it equals the
+          dense list; in the middle it mixes the two. The top result of
+          the fused list often differs from the top result of either of
+          the individual lists, because each retriever pushes documents
+          forward that the other missed, and the combination promotes
+          those that both ranked reasonably. The right weighting depends
+          on the corpus, the query distribution and the downstream task;
+          values near a half are common starting points, and final values
+          near a third for the sparse weight in dense-leaning systems are
+          also common.
+        </p>
+        <p>
+          A more aggressive form of hybrid retrieval is to take the union
+          of the two candidate sets and pass the whole union to a
+          cross-encoder reranker, which produces the final ordering on
+          its own. The disadvantage is the larger candidate set the
+          reranker has to score, and so the higher cost; the advantage is
+          that the reranker, with both signals in front of it, can make a
+          fine-grained final decision that no fixed weighting would have
+          produced. Production systems increasingly take this route, and
+          the role of the score-level fusion is to keep the
+          cross-encoder's input small.
+        </p>
+        <p>
+          A short note on reciprocal rank fusion is in order, because it
+          appears in more deployed systems than any other combiner. The
+          formula is simple: each document's score in the fused list is the
+          sum, over the constituent lists that contain it, of one divided by
+          a constant plus the document's rank in that list. A constant of
+          sixty is the value used in the original proposal and most
+          subsequent work. The formula has three useful properties. It uses
+          only ranks, so it is insensitive to the calibration of the
+          constituent scores. It heavily downweights documents that appear
+          only low in any list, so noise in the lower ranks contributes
+          little. And it is symmetric in the input lists, so it composes
+          with itself: the fusion of three retrievers can be computed by
+          fusing two and then fusing the result with the third, yielding
+          the same answer as a direct three-way fusion.
+        </p>
+      </section>
+
+      <section id="s9">
+        <h2><span class="secnum">9</span>The full pipeline</h2>
+        <p>
+          The retrieval-augmented generation pipeline assembles the
+          components of the previous sections into a single system. The
+          query is embedded by the query encoder; the first-stage retriever
+          searches the index for the top-k candidates; the reranker scores
+          each candidate against the query and reorders the list; the top
+          few reranked candidates are inserted into the generator's prompt;
+          and the generator writes the answer conditioned on the
+          retrieved context. Each stage corresponds to a component
+          discussed earlier, and each adds its own latency, compute cost
+          and failure mode.
+        </p>
+
+        <div id="fig-pipeline"></div>
+
+        <p>
+          The figure above runs the reader through the five stages in
+          turn. Two practical questions arise once the stages are in
+          place. The first is whether the retriever should be conditioned
+          on the conversation so far rather than only on the latest
+          query, since a user's question often refers to entities and
+          topics introduced earlier in the conversation. The standard
+          remedy is a query rewriting step that summarises the
+          conversation into a self-contained query before retrieval. The
+          second is whether the generator should be allowed to call the
+          retriever more than once: if the first set of retrieved
+          passages does not answer the question, an iterative system can
+          have the generator emit a follow-up query and retrieve again.
+          The cost is extra latency, and the benefit is the ability to
+          handle questions whose answers require multiple steps of
+          retrieval.
+        </p>
+        <p>
+          Two further parts of the system surround the pipeline. The
+          ingestion pipeline turns documents into chunks and chunks into
+          vectors, runs incrementally as the corpus changes, and keeps
+          the index in sync. The evaluation pipeline measures the system
+          end to end, against a labelled set of queries and answers, and
+          attributes failures to specific stages. End-to-end measurement
+          is the only reliable way to set the many hyperparameters of the
+          system, because the stages interact: a chunking decision that
+          looks good in isolation can be bad once the reranker sees it,
+          and a reranker that is excellent on its own may not improve the
+          system if the first-stage retriever is already very good.
+        </p>
+        <p>
+          Operationally, the pipeline carries several less-glamorous burdens
+          worth naming. The index has to be rebuilt or incrementally
+          updated as the corpus changes; the schedule for rebuilds, the
+          fraction of the corpus updated between them and the choice
+          between full rebuilds and incremental insertion are part of the
+          system's design. The embedding model can be swapped, but only at
+          the cost of re-embedding the entire corpus, because vectors from
+          different encoders are not comparable. Some systems keep two
+          indices during a migration, with traffic gradually shifted from
+          the old to the new, and that pattern is the standard way to
+          retire an embedding model without downtime. The retriever's
+          latency budget is split between the encoder forward pass for the
+          query and the index lookup; for small models the encoder
+          dominates, for large models the index does, and the partition
+          shifts as either improves. None of these concerns appears in the
+          accuracy numbers, and all of them appear in the production
+          incident log.
+        </p>
+      </section>
+
+      <section id="s10">
+        <h2><span class="secnum">10</span>Conclusion and limits</h2>
+        <p>
+          The retrieval-augmented system is the marriage of two mature
+          subfields. Information retrieval contributed the indexing of
+          large corpora, the geometry of similarity, and the discipline of
+          evaluation against known relevance. Language modelling
+          contributed the dense embeddings, the cross-encoder reranker,
+          and the generator that finally writes the answer. The result is
+          a system that is more accurate, more up-to-date and more
+          inspectable than either component alone would have been, and
+          whose failure modes are easier to diagnose because each stage
+          has its own measurable behaviour.
+        </p>
+        <p>
+          The limits are worth stating plainly. A retrieval-augmented
+          system will fail if the corpus does not contain the answer to a
+          query: the retriever will return its best guess, the reranker
+          will order those guesses, and the generator will write a
+          confident answer from material that does not support it. A
+          retrieval-augmented system will also fail if the corpus contains
+          contradictory passages: the generator, asked to synthesise from
+          the retrieved passages, will pick a position, and the choice
+          may or may not be the right one. The retriever is a heuristic,
+          not a search engine in the strict sense, and a query that
+          requires reasoning over the whole corpus rather than over a few
+          passages exceeds its design.
+        </p>
+        <p>
+          Several practical developments mitigate these limits. Query
+          rewriting can turn an oblique question into one the retriever
+          can handle. Multiple rounds of retrieval can extend the reach
+          to multi-step questions. Citation requirements at the generator
+          level make hallucinated content visible, by forcing the
+          generator to point to the passage on which each claim depends.
+          The combination of these moves, with the components of the
+          previous sections in their classical form, has put
+          retrieval-augmented generation at the centre of the practical
+          deployment of language models. A reader who has followed the
+          pieces is positioned to read further into any of them, because
+          the same five-stage shape recurs throughout.
+        </p>
+        <a class="totop" href="#main">Return to contents</a>
+      </section>
+
+      <section id="refs" class="references" aria-label="References">
+        <h2><span class="secnum">R</span>References</h2>
+        <ol>
+          <li id="ref-1">Salton, G., Wong, A. and Yang, C. S. (1975). A vector space model for automatic indexing. <i>Communications of the ACM</i>, 18(11), 613–620.</li>
+          <li id="ref-2">Spärck Jones, K. (1972). A statistical interpretation of term specificity and its application in retrieval. <i>Journal of Documentation</i>, 28(1), 11–21.</li>
+          <li id="ref-3">Robertson, S. E. and Spärck Jones, K. (1976). Relevance weighting of search terms. <i>Journal of the American Society for Information Science</i>, 27(3), 129–146.</li>
+          <li id="ref-4">Mikolov, T., Sutskever, I., Chen, K., Corrado, G. S. and Dean, J. (2013). Distributed representations of words and phrases and their compositionality. <i>Advances in Neural Information Processing Systems</i>, 26.</li>
+          <li id="ref-5">Devlin, J., Chang, M.-W., Lee, K. and Toutanova, K. (2019). BERT: pre-training of deep bidirectional transformers for language understanding. <i>NAACL-HLT</i>.</li>
+          <li id="ref-6">Reimers, N. and Gurevych, I. (2019). Sentence-BERT: sentence embeddings using siamese BERT-networks. <i>Proceedings of EMNLP-IJCNLP</i>.</li>
+          <li id="ref-7">Karpukhin, V., Oğuz, B., Min, S., Lewis, P., Wu, L., Edunov, S., Chen, D. and Yih, W. (2020). Dense passage retrieval for open-domain question answering. <i>Proceedings of EMNLP</i>.</li>
+          <li id="ref-8">Khattab, O. and Zaharia, M. (2020). ColBERT: efficient and effective passage search via contextualized late interaction over BERT. <i>Proceedings of SIGIR</i>.</li>
+          <li id="ref-9">Malkov, Y. A. and Yashunin, D. A. (2018). Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs. <i>IEEE Transactions on Pattern Analysis and Machine Intelligence</i>, 42(4), 824–836.</li>
+          <li id="ref-10">Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Küttler, H., Lewis, M., Yih, W., Rocktäschel, T., Riedel, S. and Kiela, D. (2020). Retrieval-augmented generation for knowledge-intensive NLP tasks. <i>Advances in Neural Information Processing Systems</i>, 33.</li>
+          <li id="ref-11">Guu, K., Lee, K., Tung, Z., Pasupat, P. and Chang, M.-W. (2020). REALM: retrieval-augmented language model pre-training. <i>Proceedings of ICML</i>.</li>
+          <li id="ref-12">Borgeaud, S., Mensch, A., Hoffmann, J., Cai, T., Rutherford, E., Millican, K., van den Driessche, G., Lespiau, J.-B., Damoc, B., Clark, A., de las Casas, D., Guy, A., Menick, J., Ring, R., Hennigan, T., Huang, S., Maggiore, L., Jones, C., Cassirer, A., Brock, A., Paganini, M., Irving, G., Vinyals, O., Osindero, S., Simonyan, K., Rae, J. W., Elsen, E. and Sifre, L. (2022). Improving language models by retrieving from trillions of tokens. <i>Proceedings of ICML</i>.</li>
+        </ol>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-foot">
+    <div class="wrap">
+      Retrieval — an interactive monograph on retrieval-augmented generation.
+      Built with vanilla HTML, CSS and JavaScript; no frameworks, no build
+      step. Keyboard-operable and built to WCAG 2.2 AA. The figures run real
+      information-retrieval algorithms on synthetic data, so every nearest
+      neighbour, hop and fused rank is computed exactly.
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    Retrieval.initProgress("progress-bar");
+    Retrieval.embedding({ mount: "#fig-embedding",
+      caption: "<b>Figure 1.</b> A two-dimensional embedding space with three topic " +
+        "clusters. Move the query with the arrow keys or a click; the k slider chooses " +
+        "how many nearest documents are returned." });
+    Retrieval.metrics({ mount: "#fig-metrics",
+      caption: "<b>Figure 2.</b> The nearest corpus point under Euclidean and cosine " +
+        "metrics, marked with distinct shapes. The two metrics disagree most often near " +
+        "the boundary of the cloud." });
+    Retrieval.chunking({ mount: "#fig-chunking",
+      caption: "<b>Figure 3.</b> A synthetic document split by three strategies: fixed " +
+        "size, sentence boundaries, and sliding window. Adjacent chunks are shaded in " +
+        "alternating colours to make the boundaries visible." });
+    Retrieval.hnsw({ mount: "#fig-hnsw",
+      caption: "<b>Figure 4.</b> A hierarchical greedy search. The algorithm starts at " +
+        "the sparse top layer, follows the best neighbour, drops a layer when no " +
+        "neighbour improves, and terminates on the dense bottom layer." });
+    Retrieval.rerank({ mount: "#fig-rerank",
+      caption: "<b>Figure 5.</b> A candidate list reordered by a reranker. The initial " +
+        "order is the first-stage dense score; the reranker reads each candidate " +
+        "together with the query and produces a finer score." });
+    Retrieval.hybrid({ mount: "#fig-hybrid",
+      caption: "<b>Figure 6.</b> Hybrid retrieval: a sparse list, a dense list, and " +
+        "their convex combination. The alpha slider sets the weight of the dense score " +
+        "in the fused list." });
+    Retrieval.pipeline({ mount: "#fig-pipeline",
+      caption: "<b>Figure 7.</b> The five stages of the retrieval-augmented pipeline: " +
+        "embed the query, retrieve candidates, rerank, compose the prompt, and " +
+        "generate." });
+  </script>
+</body>
+</html>
